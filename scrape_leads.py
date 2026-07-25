@@ -1,5 +1,6 @@
 """Scrape business leads from Bing Maps using Playwright browser automation."""
 
+import os
 import re
 import time
 from playwright.sync_api import sync_playwright, Browser, Page, TimeoutError as PwTimeout
@@ -42,8 +43,28 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
     seen: set[str] = set()
 
     with sync_playwright() as p:
+        # Use system Chrome/Edge if available, otherwise fall back to Playwright Chromium
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+        executable_path = None
+        for path in chrome_paths:
+            if os.path.exists(path):
+                executable_path = path
+                print(f"[Scrape] Using system browser: {path}")
+                break
+        if not executable_path:
+            print("[Scrape] No system browser found, using Playwright Chromium (run 'playwright install chromium' if needed)")
+
         browser: Browser = p.chromium.launch(
             headless=True,
+            executable_path=executable_path,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
