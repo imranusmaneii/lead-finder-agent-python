@@ -2,8 +2,7 @@
 
 import os
 import re
-import time
-from playwright.sync_api import sync_playwright, Browser, Page, TimeoutError as PwTimeout
+from playwright.sync_api import sync_playwright, Browser, Page
 
 
 JUNK_EMAILS = [
@@ -30,6 +29,37 @@ def extract_email_from_website(page: Page, url: str) -> str:
     return ""
 
 
+def _get_browser(p):
+    """Launch browser using system Chrome/Edge or Playwright Chromium."""
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    executable_path = None
+    for path in chrome_paths:
+        if os.path.exists(path):
+            executable_path = path
+            print(f"[Scrape] Using system browser: {path}")
+            break
+    if not executable_path:
+        print("[Scrape] Using Playwright Chromium")
+
+    return p.chromium.launch(
+        headless=True,
+        executable_path=executable_path,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+
+
 def scrape_leads(business_category: str, location: str) -> list[dict]:
     """Search Bing Maps and extract business leads.
 
@@ -43,34 +73,7 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
     seen: set[str] = set()
 
     with sync_playwright() as p:
-        # Use system Chrome/Edge if available, otherwise fall back to Playwright Chromium
-        chrome_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium-browser",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        ]
-        executable_path = None
-        for path in chrome_paths:
-            if os.path.exists(path):
-                executable_path = path
-                print(f"[Scrape] Using system browser: {path}")
-                break
-        if not executable_path:
-            print("[Scrape] No system browser found, using Playwright Chromium (run 'playwright install chromium' if needed)")
-
-        browser: Browser = p.chromium.launch(
-            headless=True,
-            executable_path=executable_path,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        browser: Browser = _get_browser(p)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -93,11 +96,10 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
         # Dismiss any cookie/privacy banners
         try:
             for selector in [
-                'button:has-text("Accept")',
-                'button:has-text("I agree")',
-                'button:has-text("Agree")',
                 '#bnp_btn_accept',
                 '#bnp_btn_dismiss',
+                'button:has-text("Accept")',
+                'button:has-text("Agree")',
             ]:
                 btn = page.locator(selector).first
                 if btn.count() > 0:
@@ -109,14 +111,10 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
 
         # Find and fill the search box
         print("[Scrape] Entering search query...")
-        search_box = None
-        for selector in ["#sb_form_q", "#maps_sb", 'input[name="q"]', 'input[type="search"]', "#maps_sb_input"]:
-            loc = page.locator(selector)
-            if loc.count() > 0:
-                search_box = loc.first
-                break
-
-        if not search_box:
+        search_box = page.locator("#searchBoxInput")
+        if search_box.count() == 0:
+            search_box = page.locator('input[name="searchbox"]')
+        if search_box.count() == 0:
             print("[Scrape] ERROR: Could not find search box on Bing Maps.")
             browser.close()
             return leads
@@ -133,188 +131,176 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
 
         # Wait for results to load
         print("[Scrape] Waiting for results...")
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(6000)
 
         # Scroll the results panel to load more listings
         print("[Scrape] Scrolling results panel...")
-        for _ in range(6):
+        for _ in range(4):
             try:
-                # Try to scroll the results sidebar
-                scrolled = False
-                for scroll_sel in [
-                    ".b_results",
-                    "#b_results",
-                    ".b_algo",
-                    '[id*="result"]',
-                    "ul.b_algo",
-                ]:
-                    panel = page.locator(scroll_sel).first
-                    if panel.count() > 0:
-                        panel.evaluate("el => el.scrollBy(0, 600)")
-                        scrolled = True
-                        break
-                if not scrolled:
-                    page.mouse.wheel(0, 600)
+                page.evaluate("""() => {
+                    const panel = document.querySelector('.b_results') ||
+                                  document.querySelector('#b_results') ||
+                                  document.querySelector('[class*="listingItem"]');
+                    if (panel) panel.scrollBy(0, 500);
+                    else window.scrollBy(0, 500);
+                }""")
             except Exception:
                 try:
-                    page.mouse.wheel(0, 600)
+                    page.mouse.wheel(0, 500)
                 except Exception:
                     pass
             page.wait_for_timeout(1500)
 
-        # Extract leads from search results
+        # Extract leads from result list items
         print("[Scrape] Extracting lead data from results...")
 
-        # Try multiple selector strategies for result items
-        result_items = []
-        result_selectors = [
-            ".b_algo",
-            ".b_algo h2 a",
-            'li.b_algo',
-            '[data-bm="1"]',
-            ".b_ans",
-        ]
-        for sel in result_selectors:
-            items = page.locator(sel).all()
-            if len(items) > len(result_items):
-                result_items = items
-                print(f"[Scrape] Found {len(items)} results with selector: {sel}")
-
+        # Bing Maps puts results in <li> elements with class containing "listingItem"
+        result_items = page.locator("li.listingItem_fPE1q").all()
         if not result_items:
-            # Fallback: try all links in results area
-            print("[Scrape] No results found with standard selectors, trying fallback...")
-            all_links = page.locator("a").all()
-            for link in all_links:
-                try:
-                    href = link.get_attribute("href") or ""
-                    text = link.text_content() or ""
-                    if text.strip() and len(text.strip()) > 3:
-                        result_items.append(link)
-                except Exception:
-                    continue
-            print(f"[Scrape] Fallback found {len(result_items)} potential links")
+            # Fallback: try any li with data-key
+            result_items = page.locator("li[data-key]").all()
+        if not result_items:
+            # Broader fallback
+            result_items = page.locator("li").all()
+            result_items = [
+                item for item in result_items
+                if (item.text_content() or "").strip() and len((item.text_content() or "").strip()) > 20
+            ]
+
+        print(f"[Scrape] Found {len(result_items)} result items")
 
         for i, item in enumerate(result_items):
             if len(leads) >= 15:
                 break
+
             try:
-                # Extract business name
+                # Extract text content of the card
+                card_text = (item.text_content() or "").strip()
+                if len(card_text) < 5:
+                    continue
+
+                # Extract business name from heading or button title
                 business_name = ""
                 try:
-                    # Try to get from heading
-                    heading = item.locator("h2, h3, .b_title").first
-                    if heading.count() > 0:
-                        business_name = (heading.text_content() or "").strip()
+                    # Try h2 first
+                    h2 = item.locator("h2").first
+                    if h2.count() > 0:
+                        business_name = (h2.text_content() or "").strip()
                 except Exception:
                     pass
-
                 if not business_name:
                     try:
-                        business_name = (item.text_content() or "").split("\n")[0].strip()
+                        btn = item.locator("button[title]").first
+                        if btn.count() > 0:
+                            business_name = (btn.get_attribute("title") or "").strip()
+                    except Exception:
+                        pass
+                if not business_name:
+                    try:
+                        mag = item.locator("[data-n]").first
+                        if mag.count() > 0:
+                            business_name = (mag.get_attribute("data-n") or "").strip()
                     except Exception:
                         pass
 
                 if not business_name or len(business_name) < 2:
                     continue
 
-                # Get the detail page URL
-                detail_url = ""
-                try:
-                    link = item.locator("a").first
-                    if link.count() > 0:
-                        detail_url = link.get_attribute("href") or ""
-                except Exception:
-                    pass
+                # Skip non-business results
+                skip_words = ["item", "filter", "expand", "collapse", "map of", "toggle"]
+                if any(sw in business_name.lower() for sw in skip_words):
+                    continue
 
-                # Try to extract phone from the visible text
+                # Extract phone from card text
                 phone = ""
-                website = ""
+                pm = re.search(r"[\+]?[\d][\d\s\-\(\)]{7,}", card_text)
+                if pm:
+                    phone = pm.group(0).strip()
+
+                # Extract category and address from card text
+                card_lines = card_text.split("\n")
                 addr = ""
+                category = ""
+                for line in card_lines:
+                    line = line.strip()
+                    if not line or line == business_name:
+                        continue
+                    # Category is usually short and contains common words
+                    cat_words = ["restaurant", "fast food", "cafe", "coffee", "burger",
+                                 "pizza", "bakery", "store", "shop", "dentist", "clinic",
+                                 "hospital", "salon", "gym", "hotel", "bar", "pub"]
+                    if any(cw in line.lower() for cw in cat_words) and len(line) < 50:
+                        category = line
+                    # Address usually has numbers and street indicators
+                    if re.search(r"\d", line) and any(s in line.lower() for s in ["st", "ave", "blvd", "rd", "dr", "ln", "block", "sector", "road", "street"]):
+                        addr = line
+
+                # Now click to open detail panel for more info (website, full address)
+                website = ""
                 try:
-                    block_text = item.text_content() or ""
-                    phone_match = re.search(r"[\+]?[\d][\d\s\-\(\)]{7,}", block_text)
-                    if phone_match:
-                        phone = phone_match.group(0).strip()
+                    clickable = item.locator("button.listingContent_fjvwG, button").first
+                    if clickable.count() > 0:
+                        clickable.click(timeout=4000)
+                        page.wait_for_timeout(3500)
+
+                        # Look for website link in detail panel
+                        web_links = page.evaluate("""() => {
+                            const links = document.querySelectorAll('a[href]');
+                            return Array.from(links)
+                                .map(a => ({href: a.href, text: a.textContent.trim()}))
+                                .filter(l => l.href.startsWith('http') &&
+                                    !l.href.includes('bing.com') &&
+                                    !l.href.includes('microsoft.com') &&
+                                    !l.href.includes('go.microsoft'))
+                                .slice(0, 10);
+                        }""")
+                        for wl in web_links:
+                            href = wl.get("href", "")
+                            text = wl.get("text", "").lower()
+                            if "website" in text or "visit" in text or "open" in text:
+                                website = href
+                                break
+                        if not website and web_links:
+                            website = web_links[0].get("href", "")
+
+                        # Try to get full address from detail
+                        if not addr:
+                            addr = page.evaluate("""() => {
+                                const panels = document.querySelectorAll(
+                                    '[class*="detail"], [class*="panel"], [class*="sidebar"], [class*="entity"]'
+                                );
+                                for (const p of panels) {
+                                    const text = p.textContent || '';
+                                    if (text.length > 20) return text.substring(0, 500);
+                                }
+                                return '';
+                            }""")
+
+                        # Go back to list
+                        try:
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(1500)
+                        except Exception:
+                            pass
+
                 except Exception:
                     pass
-
-                # Now click into the Bing Maps result to get details
-                # Bing Maps shows a side panel with details when you click
-                if detail_url and "bing.com/maps" in detail_url:
-                    try:
-                        item.click(timeout=4000)
-                        page.wait_for_timeout(3000)
-
-                        detail_text = ""
-                        try:
-                            detail_panel = page.locator(
-                                '[class*="detail"], [class*="panel"], [class*="sidebar"], '
-                                '[class*="entity"], .b_entityPanel'
-                            ).first
-                            if detail_panel.count() > 0:
-                                detail_text = detail_panel.text_content() or ""
-                        except Exception:
-                            pass
-
-                        if not detail_text:
-                            detail_text = page.locator("body").text_content() or ""
-
-                        # Extract phone from detail
-                        if not phone:
-                            pm = re.search(r"[\+]?[\d][\d\s\-\(\)]{7,}", detail_text)
-                            if pm:
-                                phone = pm.group(0).strip()
-
-                        # Extract website from detail
-                        try:
-                            web_link = page.locator(
-                                'a[href*="http"]:not([href*="bing.com"]):not([href*="microsoft.com"]):not([href*="go.microsoft"])'
-                            ).first
-                            if web_link.count() > 0:
-                                href = web_link.get_attribute("href") or ""
-                                if href and "bing.com" not in href and "microsoft.com" not in href:
-                                    website = href
-                        except Exception:
-                            pass
-
-                        # Extract address from detail
-                        if not addr:
-                            try:
-                                addr_el = page.locator(
-                                    '[class*="address"], [class*="addr"]'
-                                ).first
-                                if addr_el.count() > 0:
-                                    addr = (addr_el.text_content() or "").strip()
-                            except Exception:
-                                pass
-
-                        # Go back to results list
-                        try:
-                            back_btn = page.locator(
-                                'button[aria-label*="Back"], button[aria-label*="back"], '
-                                'a[aria-label*="Back"], #backBtn'
-                            ).first
-                            if back_btn.count() > 0:
-                                back_btn.click(timeout=3000)
-                                page.wait_for_timeout(2000)
-                        except Exception:
-                            page.go_back(timeout=5000)
-                            page.wait_for_timeout(2000)
-
-                    except Exception:
-                        pass
 
                 # Visit business website to find email
                 email = ""
                 if website:
                     try:
-                        normalized_url = (
-                            website if website.startswith("http") else f"https://{website}"
+                        email = extract_email_from_website(
+                            page,
+                            website if website.startswith("http") else f"https://{website}",
                         )
-                        email = extract_email_from_website(page, normalized_url)
-                        # Go back to Bing Maps
-                        page.go_back(timeout=5000)
-                        page.wait_for_timeout(1000)
+                        # Navigate back to Bing Maps
+                        page.goto(
+                            f"https://www.bing.com/maps/search?style=r&q={search_query.replace(' ', '+')}",
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                        page.wait_for_timeout(4000)
                     except Exception:
                         pass
 
@@ -340,106 +326,7 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
                 print(f"[Scrape] Error processing result {i}: {e}")
                 continue
 
-        # If Bing Maps didn't yield results, try Google Search as fallback
-        if not leads:
-            print("[Scrape] Bing Maps yielded no results. Trying Google Search fallback...")
-            try:
-                leads = _google_search_fallback(page, search_query, seen)
-            except Exception as e:
-                print(f"[Scrape] Google Search fallback failed: {e}")
-
         browser.close()
 
     print(f"[Scrape] Completed. Found {len(leads)} leads for \"{search_query}\"")
-    return leads
-
-
-def _google_search_fallback(page: Page, search_query: str, seen: set) -> list[dict]:
-    """Fallback: scrape business info from Google Search local results."""
-    leads: list[dict] = []
-
-    try:
-        page.goto(
-            f"https://www.google.com/search?q={search_query}",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        page.wait_for_timeout(3000)
-
-        # Google's local pack shows business cards
-        cards = page.locator('[data-attrid="kc:/local:one box"]').all()
-        if not cards:
-            cards = page.locator('.VkpGBb, .dbg0pd, [data-local-attribute]').all()
-        if not cards:
-            cards = page.locator('.rllt__details').all()
-
-        print(f"[Scrape-Fallback] Found {len(cards)} local result cards")
-
-        for card in cards[:15]:
-            try:
-                text = card.text_content() or ""
-
-                business_name = ""
-                try:
-                    name_el = card.locator("[role='heading'], .dbg0pd, .OSrXXb").first
-                    if name_el.count() > 0:
-                        business_name = (name_el.text_content() or "").strip()
-                except Exception:
-                    pass
-                if not business_name:
-                    business_name = text.split("\n")[0].strip()[:100]
-
-                if not business_name or len(business_name) < 2:
-                    continue
-
-                phone = ""
-                pm = re.search(r"[\+]?[\d][\d\s\-\(\)]{7,}", text)
-                if pm:
-                    phone = pm.group(0).strip()
-
-                website = ""
-                try:
-                    web_el = card.locator("a[href^='http']:not([href*='google'])").first
-                    if web_el.count() > 0:
-                        website = web_el.get_attribute("href") or ""
-                except Exception:
-                    pass
-
-                addr = ""
-                try:
-                    addr_el = card.locator('[data-local-attribute="addressLine1"], .rllt__details div:nth-child(3)').first
-                    if addr_el.count() > 0:
-                        addr = (addr_el.text_content() or "").strip()
-                except Exception:
-                    pass
-
-                dedup_key = f"{business_name.lower()}|{phone}|{website}"
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
-
-                email = ""
-                if website:
-                    try:
-                        email = extract_email_from_website(
-                            page, website if website.startswith("http") else f"https://{website}"
-                        )
-                    except Exception:
-                        pass
-
-                leads.append({
-                    "business_name": business_name,
-                    "email": email or "",
-                    "phone": phone or "",
-                    "website": website or "",
-                    "location": addr or "",
-                })
-                print(f"[Scrape-Fallback] Lead {len(leads)}: {business_name}")
-
-            except Exception:
-                continue
-
-    except Exception as e:
-        print(f"[Scrape-Fallback] Error: {e}")
-
     return leads
