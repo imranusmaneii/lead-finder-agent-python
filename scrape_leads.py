@@ -13,6 +13,11 @@ JUNK_EMAILS = [
     "wix.com", "squarespace.com", "weebly.com", "godaddy.com",
 ]
 
+JUNK_WEBSITES = [
+    "bingplaces.com", "openstreetmap.org", "microsoft.com", "bing.com",
+    "google.com/maps", "go.microsoft",
+]
+
 
 def extract_email_from_website(page: Page, url: str) -> str:
     """Visit a business website and try to find an email address."""
@@ -251,7 +256,9 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
                                 .filter(l => l.href.startsWith('http') &&
                                     !l.href.includes('bing.com') &&
                                     !l.href.includes('microsoft.com') &&
-                                    !l.href.includes('go.microsoft'))
+                                    !l.href.includes('go.microsoft') &&
+                                    !l.href.includes('bingplaces.com') &&
+                                    !l.href.includes('openstreetmap.org'))
                                 .slice(0, 10);
                         }""")
                         for wl in web_links:
