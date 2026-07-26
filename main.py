@@ -3,25 +3,57 @@
 Usage:
     python main.py
     python main.py "coffee shops in America"
+    python main.py --prompt "dentists in New York" --output results.xlsx
 
 The agent:
 1. Parses the user prompt into business category + location
 2. Scrapes Bing Maps for matching businesses
-3. Extracts business name, phone, website, address, and email
-4. Saves results to an Excel file
-5. Prints a summary
+3. Falls back to Google Search if Bing Maps returns no results
+4. Extracts business name, phone, website, address, and email
+5. Saves results to an Excel file
+6. Prints a summary
 """
 
+import argparse
 import sys
 from parse_prompt import parse_prompt
 from scrape_leads import scrape_leads
 from build_excel import build_excel, get_excel_filename
 
+__version__ = "1.0.0"
+
 
 def main() -> None:
-    # Get prompt from command-line argument or interactive input
-    if len(sys.argv) > 1:
-        prompt = " ".join(sys.argv[1:])
+    parser = argparse.ArgumentParser(
+        prog="lead-finder",
+        description="Find business leads from Bing Maps / Google Search.",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help='Search prompt, e.g. "coffee shops in America"',
+    )
+    parser.add_argument(
+        "-p", "--prompt-flag",
+        dest="prompt_flag",
+        help="Alternative way to pass the search prompt",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Custom output Excel filename (default: auto-generated)",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    args = parser.parse_args()
+
+    # Determine the prompt from positional args or --prompt-flag
+    if args.prompt_flag:
+        prompt = args.prompt_flag
+    elif args.prompt:
+        prompt = " ".join(args.prompt)
     else:
         prompt = input("Enter your search prompt (e.g. 'coffee shops in America'): ").strip()
 
@@ -30,7 +62,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"\n{'='*60}")
-    print(f"  Lead Finder Agent")
+    print(f"  Lead Finder Agent v{__version__}")
     print(f"{'='*60}")
     print(f"  Prompt: {prompt}")
 
@@ -59,7 +91,32 @@ def main() -> None:
 
     # Step 3: Save to Excel
     if leads:
-        filename = build_excel(leads, business_category, location)
+        if args.output:
+            filename = args.output
+            if not filename.endswith(".xlsx"):
+                filename += ".xlsx"
+            from openpyxl import Workbook
+            from build_excel import COLUMNS, LEAD_KEYS
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Leads"
+            from openpyxl.styles import Font, PatternFill, Alignment
+            header_font = Font(bold=True, color="FFFFFF", size=11)
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            for col_idx, header in enumerate(COLUMNS, start=1):
+                cell = ws.cell(row=1, column=col_idx, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="left")
+            for row_idx, lead in enumerate(leads, start=2):
+                for col_idx, key in enumerate(LEAD_KEYS, start=1):
+                    ws.cell(row=row_idx, column=col_idx, value=lead.get(key, ""))
+            col_widths = [30, 30, 20, 35, 40]
+            for col_idx, width in enumerate(col_widths, start=1):
+                ws.column_dimensions[chr(64 + col_idx)].width = width
+            wb.save(filename)
+        else:
+            filename = build_excel(leads, business_category, location)
         print(f"\n  Excel file saved: {filename}")
     else:
         filename = get_excel_filename(business_category, location)
