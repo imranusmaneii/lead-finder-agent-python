@@ -335,5 +335,210 @@ def scrape_leads(business_category: str, location: str) -> list[dict]:
 
         browser.close()
 
+    # Fallback to Google Search if Bing Maps returned no results
+    if not leads:
+        print("[Scrape] Bing Maps returned no results. Falling back to Google Search...")
+        leads = _scrape_google_fallback(business_category, location)
+
     print(f"[Scrape] Completed. Found {len(leads)} leads for \"{search_query}\"")
+    return leads
+
+
+def _scrape_google_fallback(business_category: str, location: str) -> list[dict]:
+    """Fall back to Google Search when Bing Maps returns no results.
+
+    Searches Google for local business listings and extracts name, phone,
+    website, and address from the local pack and organic results.
+    """
+    search_query = f"{business_category} in {location}" if location else business_category
+    leads: list[dict] = []
+    seen: set[str] = set()
+
+    with sync_playwright() as p:
+        browser: Browser = _get_browser(p)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => false});"
+        )
+        page = context.new_page()
+
+        print(f"[Google] Searching: \"{search_query}\"")
+        page.goto(
+            f"https://www.google.com/search?q={search_query.replace(' ', '+')}&tbm=lcl",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        page.wait_for_timeout(4000)
+
+        # Dismiss consent dialogs
+        try:
+            for selector in [
+                'button:has-text("Accept all")',
+                'button:has-text("I agree")',
+                '#L2AGLb',
+                '#btnN',
+            ]:
+                btn = page.locator(selector).first
+                if btn.count() > 0:
+                    btn.click(timeout=3000)
+                    page.wait_for_timeout(1000)
+                    break
+        except Exception:
+            pass
+
+        # Extract from Google local pack (the map + list of businesses)
+        print("[Google] Extracting local pack results...")
+        local_results = page.evaluate("""() => {
+            const results = [];
+            // Try local pack items
+            const items = document.querySelectorAll('.VkpGBb, .rllt__details, [data-attrid="kc:/local:one box"]');
+            for (const item of items) {
+                const text = item.textContent || '';
+                if (text.length > 5) {
+                    results.push({
+                        text: text.substring(0, 500),
+                        tag: item.tagName,
+                        class: item.className.substring(0, 100)
+                    });
+                }
+            }
+            // Also try organic results with location info
+            const organic = document.querySelectorAll('.g, .tF2Cxc');
+            for (const item of organic) {
+                const text = item.textContent || '';
+                if (text.length > 20 && text.length < 1000) {
+                    results.push({
+                        text: text.substring(0, 500),
+                        tag: item.tagName,
+                        class: item.className.substring(0, 100)
+                    });
+                }
+            }
+            return results.slice(0, 20);
+        }""")
+
+        print(f"[Google] Found {len(local_results)} raw result blocks")
+
+        for block in local_results:
+            if len(leads) >= 15:
+                break
+
+            text = block.get("text", "")
+            if len(text) < 10:
+                continue
+
+            # Extract business name — usually the first meaningful line
+            business_name = ""
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            for line in lines:
+                # Skip lines that are just ratings, hours, or addresses
+                if re.match(r"^\d+\.?\s*$", line):
+                    continue
+                if re.match(r"^[\d:.\s\-–]+(?:AM|PM|am|pm)?", line):
+                    continue
+                if re.search(r"open|closed|closes|hours", line, re.I):
+                    continue
+                if len(line) >= 3 and len(line) <= 80:
+                    business_name = line
+                    break
+
+            if not business_name or len(business_name) < 2:
+                continue
+
+            # Skip non-business results
+            skip_words = ["people also ask", "related searches", "see more",
+                          "reviews", "advertisement", "sponsored"]
+            if any(sw in business_name.lower() for sw in skip_words):
+                continue
+
+            # Extract phone
+            phone = ""
+            pm = re.search(r"[\+]?[\d][\d\s\-\(\)]{7,}", text)
+            if pm:
+                phone = pm.group(0).strip()
+
+            # Extract address — look for street-like patterns
+            addr = ""
+            for line in lines:
+                if re.search(r"\d", line) and any(s in line.lower() for s in
+                    ["st", "ave", "blvd", "rd", "dr", "ln", "road", "street",
+                     "lane", "drive", "boulevard", "way", "court", "ct", "pl"]):
+                    addr = line
+                    break
+            # Also try lines with common location indicators
+            if not addr:
+                for line in lines:
+                    if any(s in line.lower() for s in
+                        ["block", "sector", "floor", "suite", "apt", "unit",
+                         "building", "center", "mall", "plaza"]):
+                        addr = line
+                        break
+
+            # Extract website from links
+            website = ""
+            try:
+                links = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => ({href: a.href, text: a.textContent.trim()}))
+                        .filter(l => l.href.startsWith('http') &&
+                            !l.href.includes('google.com') &&
+                            !l.href.includes('gstatic.com') &&
+                            !l.href.includes('googleapis.com'))
+                        .slice(0, 10);
+                }""")
+                for link in links:
+                    href = link.get("href", "")
+                    link_text = link.get("text", "").lower()
+                    if "website" in link_text or "visit" in link_text:
+                        website = href
+                        break
+                if not website and links:
+                    website = links[0].get("href", "")
+            except Exception:
+                pass
+
+            # Dedup
+            dedup_key = f"{business_name.lower()}|{phone}|{website}"
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            leads.append({
+                "business_name": business_name,
+                "email": "",
+                "phone": phone or "",
+                "website": website or "",
+                "location": addr or "",
+            })
+            print(
+                f"[Google] Lead {len(leads)}: {business_name} | "
+                f"Phone: {phone or 'N/A'} | Web: {website or 'N/A'}"
+            )
+
+        # Try to get emails from websites
+        print("[Google] Attempting email extraction from websites...")
+        for lead in leads:
+            if lead["website"]:
+                try:
+                    email = extract_email_from_website(
+                        page,
+                        lead["website"] if lead["website"].startswith("http")
+                        else f"https://{lead['website']}",
+                    )
+                    if email:
+                        lead["email"] = email
+                except Exception:
+                    pass
+
+        browser.close()
+
+    print(f"[Google] Fallback completed. Found {len(leads)} leads")
     return leads
