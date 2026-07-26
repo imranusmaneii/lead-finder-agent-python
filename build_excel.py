@@ -22,6 +22,8 @@ def get_excel_filename(category: str, location: str) -> str:
         return "leads.xlsx"
     if not loc:
         return f"leads_{cat}.xlsx"
+    if not cat:
+        return f"leads_{loc}.xlsx"
     return f"leads_{cat}_{loc}.xlsx"
 
 
