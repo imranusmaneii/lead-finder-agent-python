@@ -19,6 +19,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# debug artifacts
+debug_*
+*.png
+*.html
+
 # env
 .env
 .env.local
